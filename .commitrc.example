@@ -1,0 +1,16 @@
+{
+  "rules": [
+    { "type": "ci", "files": [".github/*", ".gitlab-ci.yml"] },
+    { "type": "build", "files": ["Dockerfile", "Makefile", "requirements*.txt"], "match": "any" },
+    { "type": "perf", "keywords": ["perf", "optimize", "cache"] }
+  ],
+  "scopes": {
+    "services": "api",
+    "views": "ui",
+    "migrations": "db",
+    "models": null
+  },
+  "config_extensions": [".json", ".yml", ".yaml", ".toml", ".env", ".ini", ".cfg"],
+  "fix_keywords": ["fix", "bug", "error", "crash", "regression"],
+  "max_description": 72
+}

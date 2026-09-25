@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import fnmatch
+import json
 import os
 import re
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from typing import Any
 
 Signals = dict[str, Any]
@@ -32,6 +35,46 @@ HUNK_RE = re.compile(r"^@@ [^@]* @@(.*)$")
 MAX_DESCRIPTION = 50
 # Hash of git's empty tree, used to diff a repository that has no commit yet
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+CONFIG_FILE = ".commitrc"
+TYPE_RE = re.compile(r"^[a-z]+$")
+SCOPE_RE = re.compile(r"^[a-z0-9-]+$")
+
+
+@dataclass(frozen=True)
+class Rule:
+    """A custom type rule from .commitrc, checked before the built-in rules."""
+
+    type: str
+    files: tuple[str, ...] = ()
+    keywords: tuple[str, ...] = ()
+    match: str = "all"
+
+
+@dataclass(frozen=True)
+class Config:
+    """Settings that customize the algorithm; defaults reproduce the built-in rules."""
+
+    rules: tuple[Rule, ...] = ()
+    scopes: dict[str, str] = field(default_factory=lambda: dict(SCOPE_MAP))
+    config_extensions: frozenset[str] = frozenset(CONFIG_EXTENSIONS)
+    fix_keywords: tuple[str, ...] = FIX_KEYWORDS
+    max_description: int = MAX_DESCRIPTION
+
+    @property
+    def keywords(self) -> tuple[str, ...]:
+        """Every keyword parse_diff() must count for this config."""
+        wanted = list(KEYWORDS) + list(self.fix_keywords)
+        for rule in self.rules:
+            wanted += rule.keywords
+        return tuple(dict.fromkeys(wanted))
+
+
+DEFAULT_CONFIG = Config()
+
+
+class ConfigError(ValueError):
+    """Raised when a .commitrc file cannot be read or is invalid."""
 
 
 def _git(*args: str) -> subprocess.CompletedProcess[str]:
@@ -63,13 +106,14 @@ def get_diff() -> str:
     if result.returncode != 0:
         _fail("git diff", result)
 
-    status = _git("status", "--short", "--untracked-files=all")
+    # Porcelain paths are relative to the repository root, like the diff paths
+    status = _git("status", "--porcelain", "-z", "--untracked-files=all")
     if status.returncode != 0:
         _fail("git status", status)
     untracked = [
-        line[3:].strip()
-        for line in status.stdout.splitlines()
-        if line.startswith("??")
+        entry[3:]
+        for entry in status.stdout.split("\0")
+        if entry.startswith("?? ")
     ]
 
     diff = result.stdout
@@ -83,7 +127,113 @@ def get_diff() -> str:
     return diff
 
 
-def parse_diff(diff: str) -> Signals:
+def _string_list(value: Any, key: str) -> tuple[str, ...]:
+    """Validate a JSON list of non-empty strings."""
+    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+        raise ConfigError(f'"{key}" must be a list of non-empty strings.')
+    return tuple(value)
+
+
+def _parse_rule(value: Any, index: int) -> Rule:
+    """Validate one entry of the "rules" list."""
+    where = f"rules[{index}]"
+    if not isinstance(value, dict):
+        raise ConfigError(f"{where} must be an object.")
+    unknown = set(value) - {"type", "files", "keywords", "match"}
+    if unknown:
+        raise ConfigError(f"{where}: unknown key(s) {', '.join(sorted(unknown))}.")
+    type_ = value.get("type")
+    if not isinstance(type_, str) or not TYPE_RE.match(type_):
+        raise ConfigError(f'{where}: "type" must be a lowercase word such as "ci" or "perf".')
+    files = _string_list(value.get("files", []), f"{where}.files")
+    keywords = _string_list(value.get("keywords", []), f"{where}.keywords")
+    if not files and not keywords:
+        raise ConfigError(f'{where}: set "files", "keywords" or both.')
+    match = value.get("match", "all")
+    if match not in ("all", "any"):
+        raise ConfigError(f'{where}: "match" must be "all" or "any".')
+    return Rule(type_, files, keywords, match)
+
+
+def parse_config(data: Any) -> Config:
+    """Validate decoded .commitrc content and merge it over the defaults."""
+    if not isinstance(data, dict):
+        raise ConfigError("the file must contain a JSON object.")
+    allowed = {"rules", "scopes", "config_extensions", "fix_keywords", "max_description"}
+    unknown = set(data) - allowed
+    if unknown:
+        raise ConfigError(
+            f"unknown key(s) {', '.join(sorted(unknown))}; "
+            f"allowed keys are {', '.join(sorted(allowed))}."
+        )
+
+    rules = data.get("rules", [])
+    if not isinstance(rules, list):
+        raise ConfigError('"rules" must be a list.')
+
+    scopes = dict(SCOPE_MAP)
+    custom_scopes = data.get("scopes", {})
+    if not isinstance(custom_scopes, dict):
+        raise ConfigError('"scopes" must be an object mapping names to scopes.')
+    for name, scope in custom_scopes.items():
+        if scope is None:
+            scopes.pop(name.lower(), None)
+        elif isinstance(scope, str) and SCOPE_RE.match(scope):
+            scopes[name.lower()] = scope
+        else:
+            raise ConfigError(
+                f'scopes["{name}"] must be a scope made of a-z, 0-9 and "-", or null to remove it.'
+            )
+
+    extensions = _string_list(
+        data.get("config_extensions", sorted(CONFIG_EXTENSIONS)), "config_extensions"
+    )
+    for ext in extensions:
+        if not ext.startswith("."):
+            raise ConfigError(f'config_extensions: "{ext}" must start with a dot.')
+
+    max_description = data.get("max_description", MAX_DESCRIPTION)
+    if isinstance(max_description, bool) or not isinstance(max_description, int) or max_description < 10:
+        raise ConfigError('"max_description" must be an integer of at least 10.')
+
+    return Config(
+        rules=tuple(_parse_rule(rule, i) for i, rule in enumerate(rules)),
+        scopes=scopes,
+        config_extensions=frozenset(ext.lower() for ext in extensions),
+        fix_keywords=_string_list(data.get("fix_keywords", list(FIX_KEYWORDS)), "fix_keywords"),
+        max_description=max_description,
+    )
+
+
+def load_config(path: str) -> Config:
+    """Read and validate a .commitrc file."""
+    try:
+        with open(path, encoding="utf-8") as file:
+            data = json.load(file)
+    except OSError as error:
+        raise ConfigError(f"cannot read {path}: {error.strerror}.") from error
+    except json.JSONDecodeError as error:
+        raise ConfigError(
+            f"{path} is not valid JSON (line {error.lineno}, column {error.colno}: {error.msg})."
+        ) from error
+    try:
+        return parse_config(data)
+    except ConfigError as error:
+        raise ConfigError(f"{path}: {error}") from error
+
+
+def find_config() -> str | None:
+    """Return the .commitrc of the repository root, else of the home directory, if any."""
+    root = _git("rev-parse", "--show-toplevel").stdout.strip()
+    candidates = [os.path.join(root, CONFIG_FILE)] if root else []
+    candidates.append(os.path.join(os.path.expanduser("~"), CONFIG_FILE))
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def parse_diff(diff: str, config: Config = DEFAULT_CONFIG) -> Signals:
     """Step 1 — extract raw signals from the diff text."""
     files: list[str] = []
     new_files: list[str] = []
@@ -154,8 +304,8 @@ def parse_diff(diff: str) -> Signals:
 
     added_text = "\n".join(added_lines)
     keywords = {
-        kw: len(re.findall(rf"\b{kw}", added_text, flags=0 if kw.isupper() else re.IGNORECASE))
-        for kw in KEYWORDS
+        kw: len(re.findall(rf"\b{re.escape(kw)}", added_text, flags=0 if kw.isupper() else re.IGNORECASE))
+        for kw in config.keywords
     }
 
     return {
@@ -184,27 +334,52 @@ def _is_test_file(path: str) -> bool:
     )
 
 
-def _is_config_file(path: str) -> bool:
+def _is_config_file(path: str, extensions: frozenset[str]) -> bool:
     """Tell whether a path is a configuration file."""
     name = os.path.basename(path)
     ext = os.path.splitext(name)[1].lower()
-    return ext in CONFIG_EXTENSIONS or name == ".env" or name.startswith(".env.")
+    is_env = name == ".env" or name.startswith(".env.")
+    return ext in extensions or (is_env and ".env" in extensions)
 
 
-def classify_type(signals: Signals) -> str:
+def _matches(path: str, pattern: str) -> bool:
+    """Match a glob against the full path, or the file name when it has no "/"."""
+    if fnmatch.fnmatch(path, pattern):
+        return True
+    return "/" not in pattern and fnmatch.fnmatch(os.path.basename(path), pattern)
+
+
+def _rule_applies(rule: Rule, signals: Signals) -> bool:
+    """Tell whether every condition set on a custom rule holds."""
+    files = signals["files"]
+    if rule.files:
+        hits = [any(_matches(f, p) for p in rule.files) for f in files]
+        check = all if rule.match == "all" else any
+        if not files or not check(hits):
+            return False
+    if rule.keywords and not any(signals["keywords"].get(kw) for kw in rule.keywords):
+        return False
+    return True
+
+
+def classify_type(signals: Signals, config: Config = DEFAULT_CONFIG) -> str:
     """Step 2 — pick the Conventional Commits type with prioritized heuristics."""
     files = signals["files"]
     added, removed = signals["added"], signals["removed"]
+
+    for rule in config.rules:
+        if _rule_applies(rule, signals):
+            return rule.type
 
     if files and all(_is_test_file(f) for f in files):
         return "test"
     if files and all(f.lower().endswith(".md") for f in files):
         return "docs"
-    if files and all(_is_config_file(f) for f in files):
+    if files and all(_is_config_file(f, config.config_extensions) for f in files):
         return "chore"
     if signals["new_files"] and (removed < 10 or removed * 4 <= added):
         return "feat"
-    if any(signals["keywords"].get(kw) for kw in FIX_KEYWORDS):
+    if any(signals["keywords"].get(kw) for kw in config.fix_keywords):
         return "fix"
     if removed > 2 * added:
         return "refactor"
@@ -216,21 +391,21 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
 
 
-def _file_scope(path: str) -> str | None:
+def _file_scope(path: str, scopes: dict[str, str]) -> str | None:
     """Map a single path to a known scope, or None if it matches none."""
     parts = path.split("/")
     for part in parts[:-1]:
-        if part.lower() in SCOPE_MAP:
-            return SCOPE_MAP[part.lower()]
+        if part.lower() in scopes:
+            return scopes[part.lower()]
     stem = os.path.splitext(parts[-1])[0].lower()
-    if stem in SCOPE_MAP:
-        return SCOPE_MAP[stem]
+    if stem in scopes:
+        return scopes[stem]
     if _is_test_file(path):
         return "tests"
     return None
 
 
-def extract_scope(signals: Signals) -> str:
+def extract_scope(signals: Signals, config: Config = DEFAULT_CONFIG) -> str:
     """Step 3 — derive a scope from file paths, or "" when changes are unrelated."""
     files = signals["files"]
     if not files:
@@ -238,27 +413,30 @@ def extract_scope(signals: Signals) -> str:
     if len(files) == 1:
         path = files[0]
         stem = os.path.splitext(os.path.basename(path))[0]
-        return _file_scope(path) or _slug(stem)
+        return _file_scope(path, config.scopes) or _slug(stem)
 
-    scopes = {_file_scope(f) for f in files}
+    scopes = {_file_scope(f, config.scopes) for f in files}
     if len(scopes) == 1 and None not in scopes:
         return scopes.pop()
     return ""
 
 
-def _fit(description: str, fallback: str | None) -> str:
-    """Keep a description within MAX_DESCRIPTION, using the fallback or truncating."""
-    if len(description) <= MAX_DESCRIPTION:
+def _fit(description: str, fallback: str | None, limit: int) -> str:
+    """Keep a description within `limit` characters, using the fallback or truncating."""
+    if len(description) <= limit:
         return description
-    if fallback and len(fallback) <= MAX_DESCRIPTION:
+    if fallback and len(fallback) <= limit:
         return fallback
-    return description[:MAX_DESCRIPTION].rstrip(" _-")
+    return description[:limit].rstrip(" _-")
 
 
-def build_description(signals: Signals, type_: str, scope: str | None = None) -> str:
-    """Step 4 — short imperative description, lowercase, no period, <= 50 chars."""
+def build_description(
+    signals: Signals, type_: str, scope: str | None = None, config: Config = DEFAULT_CONFIG
+) -> str:
+    """Step 4 — short imperative description, lowercase, no period, <= max_description chars."""
+    limit = config.max_description
     if scope is None:
-        scope = extract_scope(signals)
+        scope = extract_scope(signals, config)
     new_files = signals["new_files"]
     functions = signals["functions"]
     added, removed = signals["added"], signals["removed"]
@@ -266,7 +444,7 @@ def build_description(signals: Signals, type_: str, scope: str | None = None) ->
     most_changed = max(changes, key=changes.get) if changes else "files"
     most_changed = os.path.basename(most_changed)
 
-    if new_files and type_ in ("feat", "test", "docs", "chore"):
+    if new_files and type_ not in ("fix", "refactor"):
         if len(new_files) == 1:
             description = f"add {os.path.basename(new_files[0])}"
         elif scope:
@@ -276,24 +454,24 @@ def build_description(signals: Signals, type_: str, scope: str | None = None) ->
     elif removed > 2 * added:
         element = functions[0] if functions else "code"
         target = scope or most_changed
-        description = _fit(f"remove {target} {element}", f"remove {element}")
+        description = _fit(f"remove {target} {element}", f"remove {element}", limit)
     elif functions:
         redundant = scope.rstrip("s") == type_ or scope == functions[0].lower()
         target = f" in {scope}" if scope and not redundant else ""
-        description = _fit(f"update {functions[0]}{target}", f"update {functions[0]}")
+        description = _fit(f"update {functions[0]}{target}", f"update {functions[0]}", limit)
     else:
         description = f"update {scope or most_changed}"
 
     description = description.rstrip(".")
-    return _fit(description[:1].lower() + description[1:], None)
+    return _fit(description[:1].lower() + description[1:], None, limit)
 
 
-def build_message(diff: str) -> str:
+def build_message(diff: str, config: Config = DEFAULT_CONFIG) -> str:
     """Step 5 — orchestrate the pipeline into `type(scope): description`."""
-    signals = parse_diff(diff)
-    type_ = classify_type(signals)
-    scope = extract_scope(signals)
-    description = build_description(signals, type_, scope)
+    signals = parse_diff(diff, config)
+    type_ = classify_type(signals, config)
+    scope = extract_scope(signals, config)
+    description = build_description(signals, type_, scope, config)
     if scope:
         return f"{type_}({scope}): {description}"
     return f"{type_}: {description}"
@@ -361,7 +539,13 @@ def run_commit(message: str) -> None:
 def main() -> None:
     """CLI entry point: diff, generate, confirm, then commit and push."""
     diff = get_diff()
-    message = confirm(build_message(diff))
+    path = find_config()
+    try:
+        config = load_config(path) if path else DEFAULT_CONFIG
+    except ConfigError as error:
+        print(f"Error in {CONFIG_FILE}: {error}")
+        sys.exit(1)
+    message = confirm(build_message(diff, config))
     run_commit(message)
 
 
