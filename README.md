@@ -94,6 +94,42 @@ The description is at most 50 characters, starts lowercase and has no trailing p
 | Edited `README.md` | `docs(readme): update readme` |
 | Edited `package.json` and `config.yml` | `chore: update package.json` |
 
+## Configuration: `.commitrc`
+
+You can change the rules with a `.commitrc` JSON file. Kommit uses the one at the repository root, or `~/.commitrc` if the repository has none. Every key is optional. Copy [`.commitrc.example`](.commitrc.example) to start:
+
+```json
+{
+  "rules": [
+    { "type": "ci", "files": [".github/*", ".gitlab-ci.yml"] },
+    { "type": "build", "files": ["Dockerfile", "Makefile", "requirements*.txt"], "match": "any" },
+    { "type": "perf", "keywords": ["perf", "optimize", "cache"] }
+  ],
+  "scopes": { "services": "api", "views": "ui", "migrations": "db", "models": null },
+  "config_extensions": [".json", ".yml", ".yaml", ".toml", ".env", ".ini", ".cfg"],
+  "fix_keywords": ["fix", "bug", "error", "crash", "regression"],
+  "max_description": 72
+}
+```
+
+| Key | Effect | Default |
+|-----|--------|---------|
+| `rules` | Custom type rules, checked in order **before** the built-in rules; the first match wins | none |
+| `scopes` | Directory or file names mapped to a scope, merged over the default map; `null` removes a default entry | see [Scope](#3-scope) |
+| `config_extensions` | Extensions that count as config files for rule 3 (replaces the default list) | `.json .yml .yaml .toml .env` |
+| `fix_keywords` | Keywords in added lines that trigger rule 5 (replaces the default list) | `fix bug error` |
+| `max_description` | Maximum description length, at least 10 | `50` |
+
+Each rule has a `type` (a lowercase word) and at least one condition. When both are set, both must hold.
+
+- `files`: glob patterns (`*`, `?`, `[abc]`). A pattern without `/` also matches the file name in any directory, so `Dockerfile` matches `docker/Dockerfile`. `*` also matches across `/`, so `.github/*` covers `.github/workflows/test.yml`.
+- `match`: `"all"` (default) requires every changed file to match; `"any"` requires at least one.
+- `keywords`: words searched at the start of a word in added lines. Matching ignores case unless the keyword is all uppercase, like `TODO`.
+
+An invalid `.commitrc` stops Kommit with a message naming the file and the problem. It never falls back silently to the defaults.
+
+The `.commitrc` file itself is part of your changes until you commit it, so it can affect the first message it produces.
+
 ## Tests
 
 ```bash
