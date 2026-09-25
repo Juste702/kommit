@@ -95,6 +95,8 @@ def parse_diff(diff: str) -> Signals:
     functions: list[str] = []
     current: str | None = None
     in_untracked = False
+    # "---"/"+++" are file headers only before the first hunk of each file
+    in_header = False
 
     def add_function(name: str) -> None:
         """Record a touched function name once."""
@@ -114,13 +116,15 @@ def parse_diff(diff: str) -> Signals:
             current = match.group(2) if match else line.split()[-1]
             files.append(current)
             changes_per_file.setdefault(current, 0)
+            in_header = True
         elif line.startswith("new file mode") and current:
             new_files.append(current)
         elif line.startswith("deleted file mode") and current:
             deleted_files.append(current)
-        elif line.startswith("+++") or line.startswith("---"):
+        elif in_header and (line.startswith("+++") or line.startswith("---")):
             continue
         elif line.startswith("@@"):
+            in_header = False
             hunk = HUNK_RE.match(line)
             if hunk:
                 definition = DEFINITION_RE.search(hunk.group(1))
